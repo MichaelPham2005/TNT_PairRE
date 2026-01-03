@@ -463,6 +463,13 @@ class TNTComplEx(TKBCModel):
         ], 1)
 
 
+# Import ComplexPairRETNT
+try:
+    from models_complex import ComplexPairRETNT
+except ImportError:
+    pass
+
+
 class TNTPairRE(TKBCModel):
     """
     TNT-PairRE: Temporal PairRE with TNT-style Decomposition
@@ -613,11 +620,17 @@ class TNTPairRE(TKBCModel):
         # Concatenate all chunks
         scores = torch.cat(scores, dim=1)  # (batch, n_entities)
         
-        # Factors for regularization
+        # Factors for regularization - match TNTComplEx format (batch, rank)
+        # Return element-wise square roots, not L2 norms
+        # N3 will sum over all elements including the rank dimension
+        r_temporal = r_H_t + r_T_t  # temporal part
+        r_static = r_H + r_T        # static part
+        
         factors = (
-            e_h,
-            r_H + r_T + r_H_t + r_T_t,
-            e_t
+            torch.sqrt(e_h ** 2 + 1e-10),           # (batch, rank) - element-wise sqrt
+            torch.sqrt(r_temporal ** 2 + 1e-10),    # (batch, rank)
+            torch.sqrt(r_static ** 2 + 1e-10),      # (batch, rank)
+            torch.sqrt(e_t ** 2 + 1e-10)            # (batch, rank)
         )
         
         # Time embeddings for temporal regularization
@@ -745,7 +758,7 @@ class TNTPairRE(TKBCModel):
                 lhs = e_h * r_H_l
                 
                 # Get target scores
-                targets = self.score(these_queries)
+                targets = self.score(these_queries).squeeze(1)  # (batch,) not (batch, 1)
                 
                 # Compute scores for all entities in chunks
                 c_begin = 0
@@ -761,23 +774,12 @@ class TNTPairRE(TKBCModel):
                     # Compute scores
                     rhs = entities_exp * r_T_l_exp
                     diff = lhs_exp - rhs
-                    scores = -torch.sum(torch.abs(diff), dim=2)
+                    scores = -torch.sum(torch.abs(diff), dim=2)  # (batch, chunk_size)
                     
-                    # Filter scores
-                    for i, query in enumerate(these_queries):
-                        filter_out = filters[(query[0].item(), query[1].item(), query[3].item())]
-                        filter_out += [queries[b_begin + i, 2].item()]
-                        if chunk_size < self.sizes[2]:
-                            filter_in_chunk = [
-                                int(x - c_begin) for x in filter_out
-                                if c_begin <= x < c_end
-                            ]
-                            scores[i, torch.LongTensor(filter_in_chunk)] = -1e6
-                        else:
-                            scores[i, torch.LongTensor(filter_out)] = -1e6
-                    
+                    # Count how many entities score better than target (for each query)
+                    targets_expanded = targets.unsqueeze(1)  # (batch, 1)
                     ranks[b_begin:b_begin + len(these_queries)] += torch.sum(
-                        (scores >= targets).float(), dim=1
+                        (scores > targets_expanded).float(), dim=1
                     ).cpu()
                     
                     c_begin = c_end
