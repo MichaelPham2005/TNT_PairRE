@@ -552,6 +552,9 @@ class TNTPairRE(TKBCModel):
         """
         Forward pass for training (1-vs-all setting)
         
+        Computes scores efficiently using batch matrix operations.
+        Score: f(h,r,t',l) = -||e_h * r^H_l - e_t' * r^T_l||_1 for all t'
+        
         Args:
             x: torch.LongTensor of shape (batch_size, 4) containing (h, r, t, l)
         
@@ -560,8 +563,6 @@ class TNTPairRE(TKBCModel):
             factors: tuple of embeddings for regularization
             time: time embeddings for temporal regularization
         """
-        batch_size = x.shape[0]
-        
         # Extract embeddings
         e_h = self.entity_embeddings(x[:, 0])  # (batch, rank)
         e_t = self.entity_embeddings(x[:, 2])  # (batch, rank)
@@ -577,39 +578,42 @@ class TNTPairRE(TKBCModel):
         r_H_l = r_H + r_H_t * tau      # (batch, rank)
         r_T_l = r_T + r_T_t * tau      # (batch, rank)
         
-        # Get all entity embeddings for scoring
+        # Compute lhs: e_h * r^H_l (batch, rank)
+        lhs = e_h * r_H_l
+        
+        # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
         
-        # Compute scores for all entities as tails
-        # score(h, r, t', l) = -||e_h * r^H_l - e_t' * r^T_l||_1
-        # We need to compute this for all t' efficiently
+        # Compute rhs for all entities efficiently
+        # We need: e_t' * r^T_l for all t'
+        # all_entities: (n_entities, rank), r_T_l: (batch, rank)
+        # Result should be: (batch, n_entities, rank)
         
-        # Expand dimensions for broadcasting
-        e_h_expanded = e_h.unsqueeze(1)        # (batch, 1, rank)
-        r_H_l_expanded = r_H_l.unsqueeze(1)    # (batch, 1, rank)
-        r_T_l_expanded = r_T_l.unsqueeze(1)    # (batch, 1, rank)
-        
+        # Expand dimensions: 
+        # r_T_l: (batch, rank) -> (batch, 1, rank)
         # all_entities: (n_entities, rank) -> (1, n_entities, rank)
-        all_entities_expanded = all_entities.unsqueeze(0)
+        r_T_l_exp = r_T_l.unsqueeze(1)  # (batch, 1, rank)
+        entities_exp = all_entities.unsqueeze(0)  # (1, n_entities, rank)
         
-        # Compute: e_h * r^H_l - e_t' * r^T_l for all t'
-        # (batch, 1, rank) * (batch, 1, rank) - (1, n_entities, rank) * (batch, 1, rank)
-        lhs = e_h_expanded * r_H_l_expanded  # (batch, 1, rank)
-        rhs = all_entities_expanded * r_T_l_expanded  # (batch, n_entities, rank)
+        # Hadamard product (element-wise): (batch, 1, rank) * (1, n_entities, rank)
+        rhs = entities_exp * r_T_l_exp  # (batch, n_entities, rank)
         
-        diff = lhs - rhs  # (batch, n_entities, rank)
+        # Compute difference: lhs - rhs
+        # lhs: (batch, rank) -> (batch, 1, rank)
+        lhs_exp = lhs.unsqueeze(1)  # (batch, 1, rank)
+        diff = lhs_exp - rhs  # (batch, n_entities, rank)
         
-        # L1 norm along rank dimension, then negate
+        # L1 distance: -||diff||_1
         scores = -torch.sum(torch.abs(diff), dim=2)  # (batch, n_entities)
         
-        # Factors for regularization (L2 on relation and time embeddings)
+        # Factors for regularization
         factors = (
-            torch.sqrt(r_H ** 2 + 1e-10).mean(dim=1, keepdim=True),  # Dummy for N3 regularizer
-            torch.sqrt(r_T ** 2 + r_H_t ** 2 + r_T_t ** 2 + 1e-10).mean(dim=1, keepdim=True),
-            torch.sqrt(e_t ** 2 + 1e-10).mean(dim=1, keepdim=True)
+            e_h,
+            r_H + r_T + r_H_t + r_T_t,
+            e_t
         )
         
-        # Return time embeddings for temporal regularization
+        # Time embeddings for temporal regularization
         time = self.time_embeddings.weight[:-1] if self.no_time_emb else self.time_embeddings.weight
         
         return scores, factors, time
