@@ -552,7 +552,7 @@ class TNTPairRE(TKBCModel):
         """
         Forward pass for training (1-vs-all setting)
         
-        Computes scores efficiently using batch matrix operations.
+        Computes scores efficiently using chunked computation.
         Score: f(h,r,t',l) = -||e_h * r^H_l - e_t' * r^T_l||_1 for all t'
         
         Args:
@@ -583,28 +583,35 @@ class TNTPairRE(TKBCModel):
         
         # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
+        n_entities = all_entities.shape[0]
         
-        # Compute rhs for all entities efficiently
-        # We need: e_t' * r^T_l for all t'
-        # all_entities: (n_entities, rank), r_T_l: (batch, rank)
-        # Result should be: (batch, n_entities, rank)
+        # Chunked computation to reduce memory
+        chunk_size = min(2000, n_entities)
+        scores = []
         
-        # Expand dimensions: 
-        # r_T_l: (batch, rank) -> (batch, 1, rank)
-        # all_entities: (n_entities, rank) -> (1, n_entities, rank)
-        r_T_l_exp = r_T_l.unsqueeze(1)  # (batch, 1, rank)
-        entities_exp = all_entities.unsqueeze(0)  # (1, n_entities, rank)
+        for chunk_start in range(0, n_entities, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_entities)
+            entities_chunk = all_entities[chunk_start:chunk_end]  # (chunk_size, rank)
+            
+            # Expand for broadcasting
+            # lhs: (batch, rank) -> (batch, 1, rank)
+            # r_T_l: (batch, rank) -> (batch, 1, rank)
+            # entities_chunk: (chunk_size, rank) -> (1, chunk_size, rank)
+            lhs_exp = lhs.unsqueeze(1)
+            r_T_l_exp = r_T_l.unsqueeze(1)
+            entities_exp = entities_chunk.unsqueeze(0)
+            
+            # Compute rhs: e_t' * r^T_l for all t' in chunk
+            rhs = entities_exp * r_T_l_exp  # (batch, chunk_size, rank)
+            
+            # Compute difference and L1 distance
+            diff = lhs_exp - rhs  # (batch, chunk_size, rank)
+            chunk_scores = -torch.sum(torch.abs(diff), dim=2)  # (batch, chunk_size)
+            
+            scores.append(chunk_scores)
         
-        # Hadamard product (element-wise): (batch, 1, rank) * (1, n_entities, rank)
-        rhs = entities_exp * r_T_l_exp  # (batch, n_entities, rank)
-        
-        # Compute difference: lhs - rhs
-        # lhs: (batch, rank) -> (batch, 1, rank)
-        lhs_exp = lhs.unsqueeze(1)  # (batch, 1, rank)
-        diff = lhs_exp - rhs  # (batch, n_entities, rank)
-        
-        # L1 distance: -||diff||_1
-        scores = -torch.sum(torch.abs(diff), dim=2)  # (batch, n_entities)
+        # Concatenate all chunks
+        scores = torch.cat(scores, dim=1)  # (batch, n_entities)
         
         # Factors for regularization
         factors = (
@@ -688,12 +695,9 @@ class TNTPairRE(TKBCModel):
         Returns:
             query embeddings: torch.Tensor of shape (batch_size, rank)
         """
-        # For PairRE, we need to return something that can be matrix-multiplied
-        # with entity embeddings to get scores
-        
-        # However, PairRE with L1 distance doesn't decompose nicely into
-        # query @ entity form. We'll return the time-conditioned h * r^H_l
-        # and store r^T_l separately for scoring
+        # For PairRE with L1 distance, standard query @ entity.T doesn't work
+        # This method is not used for actual scoring in get_ranking
+        # We override get_ranking to handle L1 distance properly
         
         e_h = self.entity_embeddings(queries[:, 0])  # (batch, rank)
         tau = self.time_embeddings(queries[:, 3])    # (batch, rank)
@@ -704,8 +708,82 @@ class TNTPairRE(TKBCModel):
         # Time-conditioned head relation
         r_H_l = r_H + r_H_t * tau
         
-        # This is a simplification - the actual scoring in get_ranking
-        # will need special handling for L1 distance
         return e_h * r_H_l
+    
+    def get_ranking(
+            self, queries: torch.Tensor,
+            filters: Dict[Tuple[int, int, int], List[int]],
+            batch_size: int = 1000, chunk_size: int = -1
+    ):
+        """
+        Custom get_ranking for TNTPairRE with L1 distance.
+        Cannot use simple query @ entity.T due to L1 distance formula.
+        """
+        if chunk_size < 0:
+            chunk_size = self.sizes[2]
+        
+        ranks = torch.ones(len(queries))
+        
+        with torch.no_grad():
+            b_begin = 0
+            while b_begin < len(queries):
+                these_queries = queries[b_begin:b_begin + batch_size]
+                
+                # Extract embeddings
+                e_h = self.entity_embeddings(these_queries[:, 0])
+                tau = self.time_embeddings(these_queries[:, 3])
+                
+                r_H = self.rel_H(these_queries[:, 1])
+                r_T = self.rel_T(these_queries[:, 1])
+                r_H_t = self.rel_H_t(these_queries[:, 1])
+                r_T_t = self.rel_T_t(these_queries[:, 1])
+                
+                # Time-conditioned relations
+                r_H_l = r_H + r_H_t * tau
+                r_T_l = r_T + r_T_t * tau
+                
+                lhs = e_h * r_H_l
+                
+                # Get target scores
+                targets = self.score(these_queries)
+                
+                # Compute scores for all entities in chunks
+                c_begin = 0
+                while c_begin < self.sizes[2]:
+                    c_end = min(c_begin + chunk_size, self.sizes[2])
+                    entities_chunk = self.entity_embeddings.weight[c_begin:c_end]
+                    
+                    # Expand for broadcasting
+                    lhs_exp = lhs.unsqueeze(1)
+                    r_T_l_exp = r_T_l.unsqueeze(1)
+                    entities_exp = entities_chunk.unsqueeze(0)
+                    
+                    # Compute scores
+                    rhs = entities_exp * r_T_l_exp
+                    diff = lhs_exp - rhs
+                    scores = -torch.sum(torch.abs(diff), dim=2)
+                    
+                    # Filter scores
+                    for i, query in enumerate(these_queries):
+                        filter_out = filters[(query[0].item(), query[1].item(), query[3].item())]
+                        filter_out += [queries[b_begin + i, 2].item()]
+                        if chunk_size < self.sizes[2]:
+                            filter_in_chunk = [
+                                int(x - c_begin) for x in filter_out
+                                if c_begin <= x < c_end
+                            ]
+                            scores[i, torch.LongTensor(filter_in_chunk)] = -1e6
+                        else:
+                            scores[i, torch.LongTensor(filter_out)] = -1e6
+                    
+                    ranks[b_begin:b_begin + len(these_queries)] += torch.sum(
+                        (scores >= targets).float(), dim=1
+                    ).cpu()
+                    
+                    c_begin = c_end
+                
+                b_begin += batch_size
+        
+        return ranks
 
 
