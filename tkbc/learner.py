@@ -9,6 +9,11 @@ from torch import optim
 from datasets import TemporalDataset
 from optimizers import TKBCOptimizer, IKBCOptimizer
 from models import ComplEx, TComplEx, TNTComplEx, TNTPairRE
+try:
+    from models_complex import ComplexPairRETNT
+except ImportError:
+    ComplexPairRETNT = None
+    
 from regularizers import N3, Lambda3, TemporalSmoothness
 
 parser = argparse.ArgumentParser(
@@ -19,7 +24,7 @@ parser.add_argument(
     help="Dataset name"
 )
 models = [
-    'ComplEx', 'TComplEx', 'TNTComplEx', 'TNTPairRE'
+    'ComplEx', 'TComplEx', 'TNTComplEx', 'TNTPairRE', 'ComplexPairRETNT'
 ]
 parser.add_argument(
     '--model', choices=models,
@@ -64,12 +69,19 @@ args = parser.parse_args()
 dataset = TemporalDataset(args.dataset)
 
 sizes = dataset.get_shape()
-model = {
+
+# Build model dict
+model_dict = {
     'ComplEx': ComplEx(sizes, args.rank),
     'TComplEx': TComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'TNTComplEx': TNTComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'TNTPairRE': TNTPairRE(sizes, args.rank, no_time_emb=args.no_time_emb),
-}[args.model]
+}
+
+if ComplexPairRETNT is not None:
+    model_dict['ComplexPairRETNT'] = ComplexPairRETNT(sizes, args.rank, no_time_emb=args.no_time_emb)
+
+model = model_dict[args.model]
 model = model.cuda()
 
 
@@ -125,7 +137,29 @@ for epoch in range(args.max_epochs):
                 avg_both(*dataset.eval(model, split, -1 if split != 'train' else 50000))
                 for split in ['valid', 'test', 'train']
             ]
-            print("valid: ", valid['MRR'])
-            print("test: ", test['MRR'])
-            print("train: ", train['MRR'])
+            print("\n" + "="*80)
+            print(f"Epoch {epoch + 1}/{args.max_epochs} Evaluation")
+            print("="*80)
+            
+            # Valid set
+            print("VALID:")
+            print(f"  MRR:      {valid['MRR']:.4f}")
+            print(f"  Hits@1:   {valid['hits@[1,3,10]'][0]:.4f}")
+            print(f"  Hits@3:   {valid['hits@[1,3,10]'][1]:.4f}")
+            print(f"  Hits@10:  {valid['hits@[1,3,10]'][2]:.4f}")
+            
+            # Test set
+            print("\nTEST:")
+            print(f"  MRR:      {test['MRR']:.4f}")
+            print(f"  Hits@1:   {test['hits@[1,3,10]'][0]:.4f}")
+            print(f"  Hits@3:   {test['hits@[1,3,10]'][1]:.4f}")
+            print(f"  Hits@10:  {test['hits@[1,3,10]'][2]:.4f}")
+            
+            # Train set
+            print("\nTRAIN:")
+            print(f"  MRR:      {train['MRR']:.4f}")
+            print(f"  Hits@1:   {train['hits@[1,3,10]'][0]:.4f}")
+            print(f"  Hits@3:   {train['hits@[1,3,10]'][1]:.4f}")
+            print(f"  Hits@10:  {train['hits@[1,3,10]'][2]:.4f}")
+            print("="*80)
 
